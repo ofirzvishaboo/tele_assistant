@@ -8,5 +8,12 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Environment variables and secrets
+.env
+.env.local
 credentials.json
 token.json
+*.json
+!package.json
+!package-lock.json
