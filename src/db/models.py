@@ -10,12 +10,19 @@ class UserState(Base):
     __tablename__ = "user_states"
 
     user_id = Column(Integer, primary_key=True)
-    conversation_state = Column(JSON, default=dict) # For LangGraph checkpoint
+    conversation_state = Column(JSON, default=dict)  # For LangGraph checkpoint
     selected_folder_id = Column(String, nullable=True)
     last_event_id = Column(String, nullable=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
-engine = create_async_engine(f"sqlite+aiosqlite:///{settings.DB_PATH}")
+# Create async engine for PostgreSQL
+engine = create_async_engine(
+    settings.DATABASE_URL,
+    echo=False,  # Set to True for SQL query logging
+    pool_pre_ping=True,  # Verify connections before using
+    pool_size=5,  # Connection pool size
+    max_overflow=10
+)
 AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 async def init_db():

@@ -4,8 +4,11 @@ from langchain_core.messages import BaseMessage, SystemMessage, HumanMessage, AI
 from langchain_openai import ChatOpenAI
 from langchain_core.tools import tool
 from src.config import settings
-from src.mcp_server.tools import google_service
+from src.mcp_server import google_service
 import json
+import logging
+
+logger = logging.getLogger(__name__)
 
 # Define the State
 class AgentState(TypedDict):
@@ -257,7 +260,29 @@ def commit_actions(state: AgentState):
     )
 
     # 2. Create Folder
+    logger.info(f"Creating folder '{folder_name}' in parent '{settings.GOOGLE_DRIVE_PARENT_FOLDER_ID}'")
     folder = google_service.drive_create_folder(folder_name, settings.GOOGLE_DRIVE_PARENT_FOLDER_ID)
+    folder_id = folder.get("id")
+    folder_name_returned = folder.get("name")
+
+    if not folder_id:
+        logger.error(f"Failed to create folder - no ID returned: {folder}")
+        raise ValueError(f"Failed to create folder: {folder}")
+
+    logger.info(f"✅ Created folder successfully:")
+    logger.info(f"   Folder ID: {folder_id}")
+    logger.info(f"   Folder name: {folder_name_returned}")
+    logger.info(f"   Full folder object: {folder}")
+
+    # Verify the folder actually exists
+    try:
+        folder_verified = google_service.drive_check_folder_exists(folder_id)
+        if not folder_verified:
+            logger.error(f"⚠️ WARNING: Folder {folder_id} was created but cannot be verified!")
+        else:
+            logger.info(f"✅ Folder {folder_id} verified and accessible")
+    except Exception as verify_error:
+        logger.warning(f"Could not verify folder immediately after creation: {verify_error}")
 
     # 3. Append to Sheet
     # Schema: event_name, people, hours, date, location, email, description, created_at, telegram_user
@@ -286,7 +311,7 @@ def commit_actions(state: AgentState):
     return {
         "messages": [AIMessage(content=f"Done! Event created. Folder: {folder.get('name')}")],
         "event_details": None, # clear
-        "folder_selection": folder.get("id") # Save for photo uploads
+        "folder_selection": folder_id  # Save for photo uploads
     }
 
 # --- Graph Definition ---

@@ -1,5 +1,5 @@
 from mcp.server.fastmcp import FastMCP
-from src.mcp_server.tools import google_service
+from src.mcp_server import google_service
 import logging
 
 # Initialize FastMCP server
