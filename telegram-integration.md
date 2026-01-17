@@ -44,6 +44,31 @@ Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
 
 ## API Endpoints for Bot Integration
 
+### 0. Consume a Cocktail Batch by Liters (recommended for Telegram bot)
+
+This endpoint lets your bot send **cocktail + liters**, and the API will reduce inventory for **all ingredients** in one request.
+
+```http
+POST /inventory/cocktails/{cocktail_id}/consume-batch
+Authorization: Bearer {token}
+Content-Type: application/json
+
+{
+  "liters": 5,
+  "location": "BAR",
+  "include_garnish": false,
+  "include_optional": false,
+  "reason": "Event: Friday night service (5L batch)",
+  "source_type": "telegram_event",
+  "source_id": 12345
+}
+```
+
+Notes:
+- This endpoint **requires `is_superuser=true`** (same as `/inventory/movements`).
+- Recipes are typically stored in `ml`/`oz`. Inventory bottles are tracked as **`unit=bottle`**.
+- The API converts “ml used” into “bottles used” using `Bottle.volume_ml`, so stock decreases by **fractional bottles**.
+
 ### 1. Get All Cocktails (with ingredients)
 
 ```http
