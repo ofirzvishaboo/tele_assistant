@@ -5,6 +5,9 @@ from src.db.models import (
     get_user_state,
     update_user_state,
     UserState,
+    BotEvent,
+    create_bot_event,
+    list_bot_events,
 )
 
 __all__ = [
@@ -12,4 +15,7 @@ __all__ = [
     "get_user_state",
     "update_user_state",
     "UserState",
+    "BotEvent",
+    "create_bot_event",
+    "list_bot_events",
 ]

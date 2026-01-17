@@ -6,6 +6,7 @@ from langchain_core.tools import tool
 from src.config import settings
 from src.mcp_server import google_service
 from src.cocktail_api import CocktailAPIClient
+import datetime
 import json
 import logging
 import asyncio
@@ -300,18 +301,19 @@ def handle_cocktail_selection(state: AgentState):
     if not cocktails:
         return {"awaiting_cocktail_selection": False}
 
-    # Run async function in sync context
+    # Servings: 3 per person, across cocktail kinds (default 4)
+    details = state.get("event_details") or {}
+    people = int(details.get("people_count") or 10)
+    kinds = max(1, len(cocktails))
+
     client = get_cocktail_client()
     processed_cocktails = []
     errors = []
 
-    # Get event ID if available (from folder_selection or event_details)
     event_id = None
     if state.get("folder_selection"):
-        # Use folder ID as event identifier
         event_id = hash(state.get("folder_selection"))
 
-    # Process cocktails synchronously using asyncio
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
@@ -321,7 +323,9 @@ def handle_cocktail_selection(state: AgentState):
                     client.process_cocktail_order(
                         cocktail_name=cocktail_name,
                         location=settings.COCKTAIL_API_LOCATION,
-                        event_id=event_id
+                        event_id=event_id,
+                        people=people,
+                        cocktail_kinds=kinds
                     )
                 )
                 if "error" in result:
@@ -435,7 +439,9 @@ def commit_actions(state: AgentState):
     cocktails = details.get("cocktails", [])
     cocktail_msg = ""
     if cocktails:
-        # Process cocktails synchronously using asyncio
+        # Servings: 3 cocktails per person, distributed across cocktail kinds (default 4)
+        people = int(details.get("people_count") or 10)
+        kinds = max(1, len(cocktails))
         try:
             client = get_cocktail_client()
             processed = []
@@ -448,7 +454,9 @@ def commit_actions(state: AgentState):
                             client.process_cocktail_order(
                                 cocktail_name=cocktail_name,
                                 location=settings.COCKTAIL_API_LOCATION,
-                                event_id=hash(folder_id)  # Use folder ID as event identifier
+                                event_id=hash(folder_id),  # Use folder ID as event identifier
+                                people=people,
+                                cocktail_kinds=kinds
                             )
                         )
                         if "error" not in result:
@@ -464,15 +472,33 @@ def commit_actions(state: AgentState):
             logger.error(f"Error processing cocktails: {e}")
             cocktail_msg = f"\n\n⚠️ Could not process cocktails: {str(e)}"
 
+    # Payload for DB: bot will call create_bot_event(**created_event)
+    created_event = {
+        "telegram_user_id": state.get("user_id"),
+        "title": details.get("title") or "",
+        "start_time": details.get("start_time") or "",
+        "end_time": details.get("end_time") or "",
+        "location": details.get("location") or "",
+        "description": details.get("description") or "",
+        "people_count": details.get("people_count"),
+        "email": details.get("email") or "",
+        "equipment": details.get("equipment") or "",
+        "folder_id": folder_id,
+        "folder_name": folder_name_returned,
+        "calendar_event_id": event.get("id"),
+        "calendar_link": event.get("htmlLink") or "",
+        "cocktails": details.get("cocktails") or [],
+    }
+
     return {
         "messages": [AIMessage(content=f"Done! Event created. Folder: {folder.get('name')}{cocktail_msg}")],
-        "event_details": None, # clear
+        "event_details": None,  # clear
         "folder_selection": folder_id,  # Save for photo uploads
-        "cocktails": None  # Clear after processing
+        "cocktails": None,  # Clear after processing
+        "created_event": created_event,
     }
 
 # --- Graph Definition ---
-import datetime
 
 workflow = StateGraph(AgentState)
 

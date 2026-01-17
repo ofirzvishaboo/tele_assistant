@@ -21,6 +21,10 @@ logger = logging.getLogger(__name__)
 MAX_RETRIES = 3
 RETRY_DELAY = 1  # seconds
 
+# Event consumption defaults (used to compute liters from people count)
+COCKTAILS_PER_PERSON = 3
+DEFAULT_COCKTAIL_KINDS = 4  # typical number of cocktail types per event
+
 
 def retry_on_error(max_retries: int = MAX_RETRIES, delay: float = RETRY_DELAY):
     """Decorator to retry function calls on transient errors."""
@@ -253,28 +257,40 @@ class CocktailAPIClient:
             raise
 
     @retry_on_error()
-    async def reduce_stock(self, inventory_item_id: str, amount: float,
-                          location: str, reason: str,
-                          source_type: Optional[str] = None,
-                          source_id: Optional[int] = None) -> Dict:
-        """Reduce inventory stock (negative change)."""
-        await self._ensure_authenticated()
+    async def consume_batch(self, cocktail_id: str, liters: float,
+                           location: Optional[str] = None,
+                           include_garnish: bool = True,
+                           include_optional: bool = True,
+                           reason: Optional[str] = None,
+                           source_type: Optional[str] = "telegram_event",
+                           source_id: Optional[int] = None) -> Dict:
+        """
+        Reduce inventory for a cocktail by liters consumed (one API call for all ingredients).
 
-        payload = {
+        POST /inventory/cocktails/{cocktail_id}/consume-batch
+        The API converts ml used into bottles using Bottle.volume_ml.
+        """
+        await self._ensure_authenticated()
+        if not location:
+            location = self.location
+
+        payload: Dict[str, Any] = {
+            "liters": liters,
             "location": location,
-            "inventory_item_id": str(inventory_item_id),
-            "change": -abs(amount),  # Ensure negative
-            "reason": reason,
+            "include_garnish": include_garnish,
+            "include_optional": include_optional,
         }
+        if reason:
+            payload["reason"] = reason
         if source_type:
             payload["source_type"] = source_type
-        if source_id:
+        if source_id is not None:
             payload["source_id"] = source_id
 
         try:
             async with httpx.AsyncClient() as client:
                 response = await client.post(
-                    f"{self.base_url}/inventory/movements",
+                    f"{self.base_url}/inventory/cocktails/{cocktail_id}/consume-batch",
                     json=payload,
                     headers=self._headers()
                 )
@@ -282,7 +298,7 @@ class CocktailAPIClient:
                 if response.status_code == 401:
                     await self.authenticate()
                     response = await client.post(
-                        f"{self.base_url}/inventory/movements",
+                        f"{self.base_url}/inventory/cocktails/{cocktail_id}/consume-batch",
                         json=payload,
                         headers=self._headers()
                     )
@@ -293,33 +309,97 @@ class CocktailAPIClient:
             if e.response.status_code == 403:
                 logger.error("Insufficient permissions: Bot user must be superuser")
                 raise ValueError("Bot user does not have permission to create inventory movements")
-            logger.error(f"Failed to reduce stock: {e}")
+            logger.error(f"Failed to consume batch: {e}")
             raise
 
+    @retry_on_error()
+    async def reduce_stock(self, inventory_item_id: str, amount: float,
+                          location: str, reason: str,
+                          source_type: Optional[str] = None,
+                          source_id: Optional[int] = None) -> Dict:
+        """Reduce inventory via POST /inventory/movements (legacy; prefer consume_batch)."""
+        await self._ensure_authenticated()
+        payload: Dict[str, Any] = {
+            "location": location,
+            "inventory_item_id": str(inventory_item_id),
+            "change": -abs(amount),
+            "reason": reason,
+        }
+        if source_type:
+            payload["source_type"] = source_type
+        if source_id is not None:
+            payload["source_id"] = source_id
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{self.base_url}/inventory/movements",
+                json=payload,
+                headers=self._headers()
+            )
+            if response.status_code == 401:
+                await self.authenticate()
+                response = await client.post(
+                    f"{self.base_url}/inventory/movements",
+                    json=payload,
+                    headers=self._headers()
+                )
+            response.raise_for_status()
+            return response.json()
+
+    def _recipe_total_ml(self, recipe_ingredients: List[Dict]) -> float:
+        """Sum liquid volume from recipe (ml and oz) to derive liters for one serving."""
+        total_ml = 0.0
+        oz_ml = 29.5735
+        for ing in recipe_ingredients or []:
+            q = float(ing.get("quantity") or 0)
+            u = (ing.get("unit") or "").lower()
+            if u == "ml":
+                total_ml += q
+            elif u in ("oz", "fl oz"):
+                total_ml += q * oz_ml
+            elif u == "dash":
+                total_ml += q * 0.9  # ~0.9ml per dash
+        return total_ml
+
     async def process_cocktail_order(self, cocktail_name: str, location: Optional[str] = None,
-                                    event_id: Optional[int] = None) -> Dict:
+                                    event_id: Optional[int] = None,
+                                    servings: int = 1,
+                                    liters: Optional[float] = None,
+                                    people: Optional[int] = None,
+                                    cocktail_kinds: Optional[int] = None) -> Dict:
         """
-        Process a cocktail order by name: get ingredients and reduce stock.
+        Process a cocktail order by name using consume-batch (one API call).
+
+        Servings (and thus liters) can be derived from headcount:
+        - Total cocktails = people * COCKTAILS_PER_PERSON (default 3 per person)
+        - This cocktail type gets: total / cocktail_kinds (default 4 kinds per event)
+        So: servings = (people * 3) / max(1, cocktail_kinds or 4)
 
         Args:
             cocktail_name: Name of the cocktail (will be resolved to ID)
             location: Location for inventory (defaults to configured location)
             event_id: Optional event ID for tracking
+            servings: Explicit number of servings. Ignored if people is set.
+            liters: Override – total liters consumed. If None, computed from recipe for 1 serving * servings.
+            people: If set, servings = (people * COCKTAILS_PER_PERSON) / cocktail_kinds (or 4).
+            cocktail_kinds: Number of cocktail types at the event; used with people. Default 4.
 
         Returns:
-            Summary of movements created
+            Summary compatible with existing callers: cocktail, movements, errors.
+            movements is derived from API response when available.
         """
         if not location:
             location = self.location
 
-        # Search for cocktail by name
-        matches = await self.search_cocktail_by_name(cocktail_name)
+        # Compute servings from people when provided
+        if people is not None and people > 0:
+            kinds = max(1, cocktail_kinds or DEFAULT_COCKTAIL_KINDS)
+            total_cocktails = people * COCKTAILS_PER_PERSON
+            servings = max(1, round(total_cocktails / kinds))
 
+        matches = await self.search_cocktail_by_name(cocktail_name)
         if not matches:
             raise ValueError(f"Cocktail '{cocktail_name}' not found")
-
         if len(matches) > 1:
-            # Multiple matches - return them for user to choose
             raise ValueError(
                 f"Multiple cocktails match '{cocktail_name}': {[m['name'] for m in matches]}"
             )
@@ -328,69 +408,54 @@ class CocktailAPIClient:
         cocktail_id = cocktail["id"]
         cocktail_name_actual = cocktail["name"]
 
-        # Get full cocktail details
-        cocktail_details = await self.get_cocktail(cocktail_id)
+        # Resolve liters: explicit override, or from recipe * servings
+        if liters is not None and liters > 0:
+            total_liters = liters
+        else:
+            details = await self.get_cocktail(cocktail_id)
+            total_ml = self._recipe_total_ml(details.get("recipe_ingredients") or [])
+            total_liters = (total_ml / 1000.0) * max(1, servings)
+            if total_liters <= 0:
+                total_liters = 0.1 * max(1, servings)  # fallback 100ml per serving
 
-        movements = []
-        errors = []
+        reason = f"Cocktail served: {cocktail_name_actual}" + (f" ({servings} serving(s))" if servings > 1 else "")
 
-        # Process each ingredient
-        for ingredient in cocktail_details.get("recipe_ingredients", []):
-            ingredient_id = ingredient.get("ingredient_id")
-            ingredient_name = ingredient.get("ingredient_name")
-            quantity = ingredient.get("quantity")
-            unit = ingredient.get("unit")
-
-            if not ingredient_id:
-                errors.append(f"Skipping {ingredient_name}: no ingredient_id")
-                continue
-
-            # Find inventory item for this ingredient
-            inventory_items = await self.get_inventory_items_by_ingredient(
-                ingredient_id, location
+        try:
+            data = await self.consume_batch(
+                cocktail_id=cocktail_id,
+                liters=total_liters,
+                location=location,
+                include_garnish=True,
+                include_optional=True,
+                reason=reason,
+                source_type="telegram_event",
+                source_id=event_id
             )
+        except Exception as e:
+            return {
+                "cocktail": cocktail_name_actual,
+                "cocktail_id": cocktail_id,
+                "movements": [],
+                "errors": [str(e)]
+            }
 
-            if not inventory_items:
-                errors.append(f"No inventory item found for {ingredient_name}")
-                continue
-
-            # Use first matching item, or match by bottle_id if specified
-            inventory_item = inventory_items[0]
-            if ingredient.get("bottle_id"):
-                matching_bottle = next(
-                    (item for item in inventory_items
-                     if item.get("bottle_id") == str(ingredient.get("bottle_id"))),
-                    None
-                )
-                if matching_bottle:
-                    inventory_item = matching_bottle
-
-            inventory_item_id = inventory_item["id"]
-
-            # Reduce stock
-            try:
-                movement = await self.reduce_stock(
-                    inventory_item_id=inventory_item_id,
-                    amount=quantity,
-                    location=location,
-                    reason=f"Cocktail served: {cocktail_name_actual}",
-                    source_type="telegram_event",
-                    source_id=event_id
-                )
-                movements.append({
-                    "ingredient": ingredient_name,
-                    "quantity": quantity,
-                    "unit": unit,
-                    "movement": movement
-                })
-            except Exception as e:
-                errors.append(f"Failed to reduce stock for {ingredient_name}: {str(e)}")
+        # Normalize response for existing callers (movements list, errors)
+        movements = []
+        if isinstance(data, dict):
+            # Response shape may vary; use common keys if present
+            moves = data.get("movements") or data.get("movement") or []
+            if isinstance(moves, list):
+                movements = moves
+            elif moves:
+                movements = [moves]
+        if not isinstance(movements, list):
+            movements = []
 
         return {
             "cocktail": cocktail_name_actual,
             "cocktail_id": cocktail_id,
             "movements": movements,
-            "errors": errors
+            "errors": []
         }
 
     async def get_inventory_items_by_ingredient(self, ingredient_id: str,

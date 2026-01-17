@@ -18,7 +18,7 @@ from langchain_core.messages import HumanMessage, AIMessage, messages_from_dict,
 from langchain_openai import ChatOpenAI
 from src.config import settings
 from src.graph import app as graph_app
-from src.db import init_db, get_user_state, update_user_state
+from src.db import init_db, get_user_state, update_user_state, create_bot_event, list_bot_events
 from src.mcp_server import google_service
 from src.cocktail_api import CocktailAPIClient
 import io
@@ -70,7 +70,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "_(I will create a Calendar event, a Drive folder, and log it in Sheets)_\n\n"
             "🔍 *Check Schedule*\n"
             "• \"Do I have events tomorrow?\"\n"
-            "• \"What is on my calendar for 2025-01-06?\"\n\n"
+            "• \"What is on my calendar for 2025-01-06?\"\n"
+            "• /events - List all events you created via the bot\n\n"
             "📂 *Manage Files*\n"
             "• Send me a *Photo* to upload it to the active event's folder.\n"
             "• Use /browse to select a different folder for uploads.\n\n"
@@ -173,63 +174,30 @@ async def search_cocktail_command(update: Update, context: ContextTypes.DEFAULT_
 
 
 async def select_event_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """List recent events and let user select one for adding cocktails."""
+    """List events from DB and let user select one for adding cocktails."""
     try:
-        from datetime import datetime, timedelta
+        user_id = update.effective_user.id
+        events = await list_bot_events(user_id, limit=20)
 
-        # Get events from the last 30 days and next 30 days
-        now = datetime.now()
-        start_time = (now - timedelta(days=30)).isoformat()
-        end_time = (now + timedelta(days=30)).isoformat()
-
-        events = google_service.calendar_check_availability(start_time, end_time)
-
-        if not events:
-            await update.message.reply_text("No events found. Schedule an event first.")
-            return
-
-        # Get folders to match with events
-        folders = google_service.drive_list_folders(settings.GOOGLE_DRIVE_PARENT_FOLDER_ID)
-        folder_map = {f['name']: f['id'] for f in folders}
-
-        keyboard = []
-        event_list = []
-
-        for event in events[:10]:  # Limit to 10 events
-            start_t = event['start'].get('dateTime', event['start'].get('date'))
-            try:
-                dt = datetime.fromisoformat(start_t.replace('Z', '+00:00'))
-                date_str = dt.strftime("%Y-%m-%d")
-                time_str = dt.strftime("%H:%M")
-            except:
-                date_str = start_t[:10] if len(start_t) >= 10 else start_t
-                time_str = ""
-
-            summary = event.get('summary', 'No Title')
-            # Try to match folder by name pattern: "YYYY-MM-DD - Title"
-            folder_name = f"{date_str} - {summary}"
-            folder_id = folder_map.get(folder_name)
-
-            # If exact match not found, try partial match
-            if not folder_id:
-                for folder_name_key, folder_id_val in folder_map.items():
-                    if summary in folder_name_key or folder_name_key.endswith(summary):
-                        folder_id = folder_id_val
-                        break
-
-            if folder_id:
-                display_name = f"{date_str} {time_str} - {summary}" if time_str else f"{date_str} - {summary}"
-                keyboard.append([InlineKeyboardButton(
-                    display_name,
-                    callback_data=f"event_{folder_id}"
-                )])
-                event_list.append({"event": event, "folder_id": folder_id})
-
-        if not keyboard:
+        # Only events that have a folder (created through the bot)
+        with_folder = [ev for ev in events if ev.folder_id]
+        if not with_folder:
             await update.message.reply_text(
-                "No events with folders found. Please schedule an event first, then you can add cocktails to it."
+                "No events with folders found. Schedule an event via the bot first "
+                "(calendar + Drive folder are created together), then you can add cocktails."
             )
             return
+
+        keyboard = []
+        for ev in with_folder[:10]:
+            date_str = ev.start_time[:10] if ev.start_time and len(ev.start_time) >= 10 else "—"
+            time_str = ev.start_time[11:16] if ev.start_time and len(ev.start_time) >= 16 else ""
+            title = ev.title or "Untitled"
+            display = f"{date_str} {time_str} - {title}".strip() if time_str else f"{date_str} - {title}"
+            keyboard.append([InlineKeyboardButton(
+                display,
+                callback_data=f"event_{ev.folder_id}"
+            )])
 
         reply_markup = InlineKeyboardMarkup(keyboard)
         await update.message.reply_text(
@@ -241,18 +209,76 @@ async def select_event_command(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("Failed to load events. Please try again later.")
 
 
-async def add_cocktail_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Add a cocktail to the current event by name."""
+async def events_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """List all events created through the bot (from DB)."""
     try:
-        if not context.args:
+        user_id = update.effective_user.id
+        events = await list_bot_events(user_id)
+
+        if not events:
             await update.message.reply_text(
-                "Usage: /add_cocktail <cocktail_name>\n"
-                "Example: /add_cocktail Margarita\n\n"
+                "📭 No events yet.\n\n"
+                "Events you create via the bot (schedule + confirm) are stored here. "
+                "Schedule an event to see it listed."
+            )
+            return
+
+        lines = [f"📋 *Your events* ({len(events)}):\n"]
+        for i, ev in enumerate(events, 1):
+            start = ev.start_time[:16] if ev.start_time and len(ev.start_time) >= 16 else ev.start_time or "—"
+            block = [
+                f"*{i}. {ev.title or 'Untitled'}*",
+                f"   📅 {start}",
+                f"   📍 {ev.location or '—'}",
+                f"   👥 {ev.people_count or '—'}",
+            ]
+            if ev.folder_name:
+                block.append(f"   📁 {ev.folder_name}")
+            if ev.cocktails:
+                block.append(f"   🍹 {', '.join(ev.cocktails)}")
+            if ev.calendar_link:
+                block.append(f"   🔗 [Calendar]({ev.calendar_link})")
+            if ev.description:
+                desc = (ev.description[:80] + "…") if len(ev.description or "") > 80 else (ev.description or "")
+                block.append(f"   _{desc}_")
+            lines.append("\n".join(block) + "\n")
+
+        text = "\n".join(lines)
+        if len(text) > 4000:
+            text = text[:3960] + "\n\n_… (list truncated)_"
+        await update.message.reply_text(text, parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"Error in events_command: {e}", exc_info=True)
+        await update.message.reply_text("Failed to load events. Please try again later.")
+
+
+async def add_cocktail_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Add a cocktail to the current event by name. Optionally pass people for event-size servings."""
+    try:
+        args = context.args or []
+        if not args:
+            await update.message.reply_text(
+                "Usage: /add_cocktail <cocktail_name> [people]\n"
+                "Example: /add_cocktail Margarita\n"
+                "Example: /add_cocktail Margarita 50  (for 50 guests, 3 drinks/person, 4 kinds → ~38 servings)\n\n"
                 "Or use /select_event to choose an event first."
             )
             return
 
-        cocktail_name = " ".join(context.args)
+        # If last arg is a number, treat as people count (assume 4 kinds at event)
+        people = None
+        if len(args) >= 2 and args[-1].isdigit():
+            people = int(args[-1])
+            cocktail_name = " ".join(args[:-1])
+        else:
+            cocktail_name = " ".join(args)
+
+        if not cocktail_name.strip():
+            await update.message.reply_text(
+                "Usage: /add_cocktail <cocktail_name> [people]\n"
+                "Example: /add_cocktail Margarita 50"
+            )
+            return
         user_id = update.effective_user.id
         user_db_state = await get_user_state(user_id)
         state_dict = user_db_state.conversation_state or {}
@@ -282,7 +308,9 @@ async def add_cocktail_command(update: Update, context: ContextTypes.DEFAULT_TYP
             return
 
         if len(matches) > 1:
-            # Multiple matches - show options
+            # Multiple matches - show options; store people so callback can use it
+            state_dict["pending_add_cocktail_people"] = people
+            await update_user_state(user_id, conversation_state=state_dict)
             msg = f"Multiple cocktails match '{cocktail_name}':\n\n"
             keyboard = []
             for cocktail in matches[:10]:
@@ -299,7 +327,9 @@ async def add_cocktail_command(update: Update, context: ContextTypes.DEFAULT_TYP
         result = await client.process_cocktail_order(
             cocktail_name=cocktail['name'],
             location=settings.COCKTAIL_API_LOCATION,
-            event_id=event_id
+            event_id=event_id,
+            people=people,
+            cocktail_kinds=4 if people else None
         )
 
         if "error" in result:
@@ -419,13 +449,18 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 return
 
             event_id = hash(folder_id) if folder_id else None
+            people = state_dict.pop("pending_add_cocktail_people", None)
+            if people is not None:
+                await update_user_state(user_id, conversation_state=state_dict)
 
             try:
                 client = CocktailAPIClient()
                 result = await client.process_cocktail_order(
                     cocktail_name=cocktail_name,
                     location=settings.COCKTAIL_API_LOCATION,
-                    event_id=event_id
+                    event_id=event_id,
+                    people=people,
+                    cocktail_kinds=4 if people else None
                 )
 
                 if "error" in result:
@@ -462,6 +497,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     logger.warning(f"Failed to deserialize messages: {e}")
                     current_state["messages"] = []
 
+            current_state["user_id"] = user_id
             current_state["messages"].append(HumanMessage(content=text))
 
             try:
@@ -470,6 +506,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 logger.error(f"Error invoking graph: {e}", exc_info=True)
                 await query.edit_message_text("An error occurred. Please try again.")
                 return
+
+            if final_state.get("created_event"):
+                try:
+                    await create_bot_event(**final_state["created_event"])
+                except Exception as e:
+                    logger.warning(f"Failed to save event to DB: {e}")
+                del final_state["created_event"]
 
             last_msg = final_state["messages"][-1]
             if isinstance(last_msg, AIMessage):
@@ -494,6 +537,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             "/help - Show this help message\n"
             "/template - Get event template (Hebrew format)\n"
             "/browse - Browse and select a Drive folder for uploads\n"
+            "/select_event - Select an event to add cocktails to\n"
+            "/events - List all your events (from DB)\n"
             "/cancel - Reset the current conversation\n\n"
             "💡 *Quick Tips:*\n"
             "• Say \"Schedule a meeting on Jan 5th 10:00-11:00\" to create an event\n"
@@ -701,6 +746,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 logger.warning(f"Failed to deserialize messages: {e}")
                 current_state["messages"] = []
 
+        current_state["user_id"] = user_id
         # Append User Message
         current_state["messages"].append(HumanMessage(content=text))
 
@@ -711,6 +757,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             logger.error(f"Error invoking graph: {e}", exc_info=True)
             await update.message.reply_text("An error occurred processing your request. Please try again.")
             return
+
+        # Persist event to DB when commit_actions created one
+        if final_state.get("created_event"):
+            try:
+                await create_bot_event(**final_state["created_event"])
+            except Exception as e:
+                logger.warning(f"Failed to save event to DB: {e}")
+            del final_state["created_event"]
 
         # Check if this is a general conversation
         intent = final_state.get("intent")
@@ -825,6 +879,7 @@ async def main() -> None:
             BotCommand("template", "Get event template (Hebrew format)"),
             BotCommand("browse", "Browse and select a Drive folder for uploads"),
             BotCommand("select_event", "Select an event to add cocktails to"),
+            BotCommand("events", "List all your events (from DB)"),
             BotCommand("cocktails", "List all available cocktails"),
             BotCommand("search_cocktail", "Search for a cocktail by name"),
             BotCommand("add_cocktail", "Add a cocktail to current event"),
@@ -838,6 +893,7 @@ async def main() -> None:
         application.add_handler(CommandHandler("cancel", cancel))
         application.add_handler(CommandHandler("browse", browse_folders))
         application.add_handler(CommandHandler("select_event", select_event_command))
+        application.add_handler(CommandHandler("events", events_command))
         application.add_handler(CommandHandler("cocktails", list_cocktails_command))
         application.add_handler(CommandHandler("search_cocktail", search_cocktail_command))
         application.add_handler(CommandHandler("add_cocktail", add_cocktail_command))
