@@ -20,7 +20,9 @@ from src.config import settings
 from src.graph import app as graph_app
 from src.db import init_db, get_user_state, update_user_state
 from src.mcp_server import google_service
+from src.cocktail_api import CocktailAPIClient
 import io
+import asyncio
 
 # Configure structured logging
 log_level = getattr(logging, settings.LOG_LEVEL, logging.INFO)
@@ -72,6 +74,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "📂 *Manage Files*\n"
             "• Send me a *Photo* to upload it to the active event's folder.\n"
             "• Use /browse to select a different folder for uploads.\n\n"
+            "🍹 *Cocktails*\n"
+            "• Mention cocktails when scheduling: \"Party tomorrow with Margarita and Mojito\"\n"
+            "• /select_event - Choose an event to add cocktails to\n"
+            "• /add_cocktail <name> - Add cocktail to selected event\n"
+            "• /cocktails - List all available cocktails\n\n"
             "🔄 *Control*\n"
             "• /cancel - Reset the current conversation.",
             parse_mode="Markdown"
@@ -98,6 +105,215 @@ async def browse_folders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     except Exception as e:
         logger.error(f"Error in browse_folders: {e}", exc_info=True)
         await update.message.reply_text("Failed to load folders. Please try again later.")
+
+
+async def list_cocktails_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """List all available cocktails."""
+    try:
+        client = CocktailAPIClient()
+        cocktails = await client.get_all_cocktails()
+
+        if not cocktails:
+            await update.message.reply_text("No cocktails found.")
+            return
+
+        # Format as a list
+        msg = "🍹 *Available Cocktails:*\n\n"
+        for i, cocktail in enumerate(cocktails[:20], 1):  # Limit to 20
+            msg += f"{i}. {cocktail['name']}\n"
+
+        if len(cocktails) > 20:
+            msg += f"\n... and {len(cocktails) - 20} more"
+
+        await update.message.reply_text(msg, parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"Error in list_cocktails_command: {e}", exc_info=True)
+        await update.message.reply_text("Failed to load cocktails. Please try again later.")
+
+
+async def search_cocktail_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Search for cocktails by name."""
+    try:
+        if not context.args:
+            await update.message.reply_text("Usage: /search_cocktail <name>\nExample: /search_cocktail Margarita")
+            return
+
+        query = " ".join(context.args)
+        client = CocktailAPIClient()
+        matches = await client.search_cocktail_by_name(query)
+
+        if not matches:
+            await update.message.reply_text(f"No cocktails found matching '{query}'")
+            return
+
+        if len(matches) == 1:
+            cocktail = matches[0]
+            await update.message.reply_text(
+                f"✅ Found: *{cocktail['name']}*\n\n"
+                f"Use: /add_cocktail {cocktail['name']}",
+                parse_mode="Markdown"
+            )
+        else:
+            msg = f"Found {len(matches)} matching cocktails:\n\n"
+            keyboard = []
+            for cocktail in matches[:10]:  # Limit to 10 buttons
+                keyboard.append([InlineKeyboardButton(
+                    cocktail['name'],
+                    callback_data=f"cocktail_{cocktail['name']}"
+                )])
+
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await update.message.reply_text(
+                msg + "Select one:",
+                reply_markup=reply_markup
+            )
+    except Exception as e:
+        logger.error(f"Error in search_cocktail_command: {e}", exc_info=True)
+        await update.message.reply_text("Failed to search cocktails. Please try again later.")
+
+
+async def select_event_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """List recent events and let user select one for adding cocktails."""
+    try:
+        from datetime import datetime, timedelta
+
+        # Get events from the last 30 days and next 30 days
+        now = datetime.now()
+        start_time = (now - timedelta(days=30)).isoformat()
+        end_time = (now + timedelta(days=30)).isoformat()
+
+        events = google_service.calendar_check_availability(start_time, end_time)
+
+        if not events:
+            await update.message.reply_text("No events found. Schedule an event first.")
+            return
+
+        # Get folders to match with events
+        folders = google_service.drive_list_folders(settings.GOOGLE_DRIVE_PARENT_FOLDER_ID)
+        folder_map = {f['name']: f['id'] for f in folders}
+
+        keyboard = []
+        event_list = []
+
+        for event in events[:10]:  # Limit to 10 events
+            start_t = event['start'].get('dateTime', event['start'].get('date'))
+            try:
+                dt = datetime.fromisoformat(start_t.replace('Z', '+00:00'))
+                date_str = dt.strftime("%Y-%m-%d")
+                time_str = dt.strftime("%H:%M")
+            except:
+                date_str = start_t[:10] if len(start_t) >= 10 else start_t
+                time_str = ""
+
+            summary = event.get('summary', 'No Title')
+            # Try to match folder by name pattern: "YYYY-MM-DD - Title"
+            folder_name = f"{date_str} - {summary}"
+            folder_id = folder_map.get(folder_name)
+
+            # If exact match not found, try partial match
+            if not folder_id:
+                for folder_name_key, folder_id_val in folder_map.items():
+                    if summary in folder_name_key or folder_name_key.endswith(summary):
+                        folder_id = folder_id_val
+                        break
+
+            if folder_id:
+                display_name = f"{date_str} {time_str} - {summary}" if time_str else f"{date_str} - {summary}"
+                keyboard.append([InlineKeyboardButton(
+                    display_name,
+                    callback_data=f"event_{folder_id}"
+                )])
+                event_list.append({"event": event, "folder_id": folder_id})
+
+        if not keyboard:
+            await update.message.reply_text(
+                "No events with folders found. Please schedule an event first, then you can add cocktails to it."
+            )
+            return
+
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text(
+            "Select an event to add cocktails to:",
+            reply_markup=reply_markup
+        )
+    except Exception as e:
+        logger.error(f"Error in select_event_command: {e}", exc_info=True)
+        await update.message.reply_text("Failed to load events. Please try again later.")
+
+
+async def add_cocktail_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Add a cocktail to the current event by name."""
+    try:
+        if not context.args:
+            await update.message.reply_text(
+                "Usage: /add_cocktail <cocktail_name>\n"
+                "Example: /add_cocktail Margarita\n\n"
+                "Or use /select_event to choose an event first."
+            )
+            return
+
+        cocktail_name = " ".join(context.args)
+        user_id = update.effective_user.id
+        user_db_state = await get_user_state(user_id)
+        state_dict = user_db_state.conversation_state or {}
+
+        folder_id = state_dict.get("folder_selection")
+
+        if not folder_id:
+            await update.message.reply_text(
+                "No event selected. Please:\n"
+                "1. Use /select_event to choose an event, or\n"
+                "2. Schedule a new event first"
+            )
+            return
+
+        event_id = hash(folder_id) if folder_id else None
+
+        client = CocktailAPIClient()
+
+        # Search for cocktail
+        matches = await client.search_cocktail_by_name(cocktail_name)
+
+        if not matches:
+            await update.message.reply_text(
+                f"❌ Cocktail '{cocktail_name}' not found.\n\n"
+                f"Use /search_cocktail to find cocktails."
+            )
+            return
+
+        if len(matches) > 1:
+            # Multiple matches - show options
+            msg = f"Multiple cocktails match '{cocktail_name}':\n\n"
+            keyboard = []
+            for cocktail in matches[:10]:
+                keyboard.append([InlineKeyboardButton(
+                    cocktail['name'],
+                    callback_data=f"cocktail_{cocktail['name']}"
+                )])
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await update.message.reply_text(msg + "Select one:", reply_markup=reply_markup)
+            return
+
+        # Single match - process immediately
+        cocktail = matches[0]
+        result = await client.process_cocktail_order(
+            cocktail_name=cocktail['name'],
+            location=settings.COCKTAIL_API_LOCATION,
+            event_id=event_id
+        )
+
+        if "error" in result:
+            await update.message.reply_text(f"❌ Error: {result['error']}")
+        else:
+            msg = f"✅ Processed *{result['cocktail']}*\n\n"
+            msg += f"Reduced stock for {len(result['movements'])} ingredient(s)"
+            if result.get('errors'):
+                msg += f"\n\n⚠️ Warnings: {', '.join(result['errors'])}"
+            await update.message.reply_text(msg, parse_mode="Markdown")
+
+    except Exception as e:
+        logger.error(f"Error in add_cocktail_command: {e}", exc_info=True)
+        await update.message.reply_text("Failed to add cocktail. Please try again later.")
 
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -162,6 +378,73 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     await query.answer("Folder already selected", show_alert=False)
                 else:
                     raise
+
+        elif data.startswith("event_"):
+            folder_id = data[6:]  # Remove "event_" prefix (6 characters)
+            user_db_state = await get_user_state(user_id)
+            state_dict = user_db_state.conversation_state or {}
+
+            # Verify folder exists
+            try:
+                folder_exists = google_service.drive_check_folder_exists(folder_id)
+                if not folder_exists:
+                    await query.edit_message_text(
+                        "❌ This event folder no longer exists.",
+                        reply_markup=None
+                    )
+                    return
+            except Exception as e:
+                logger.warning(f"Could not verify folder: {e}")
+
+            # Store selected event folder
+            state_dict["folder_selection"] = folder_id
+            await update_user_state(user_id, conversation_state=state_dict)
+
+            await query.edit_message_text(
+                f"✅ Event selected. You can now use /add_cocktail <name> to add cocktails.",
+                reply_markup=None
+            )
+
+        elif data.startswith("cocktail_"):
+            cocktail_name = data[9:]  # Remove "cocktail_" prefix (9 characters)
+            user_db_state = await get_user_state(user_id)
+            state_dict = user_db_state.conversation_state or {}
+
+            folder_id = state_dict.get("folder_selection")
+            if not folder_id:
+                await query.edit_message_text(
+                    "❌ No event selected. Use /select_event first.",
+                    reply_markup=None
+                )
+                return
+
+            event_id = hash(folder_id) if folder_id else None
+
+            try:
+                client = CocktailAPIClient()
+                result = await client.process_cocktail_order(
+                    cocktail_name=cocktail_name,
+                    location=settings.COCKTAIL_API_LOCATION,
+                    event_id=event_id
+                )
+
+                if "error" in result:
+                    await query.edit_message_text(
+                        f"❌ Error processing {cocktail_name}: {result['error']}",
+                        reply_markup=None
+                    )
+                else:
+                    msg = f"✅ Processed *{result['cocktail']}*\n\n"
+                    msg += f"Reduced stock for {len(result['movements'])} ingredient(s)"
+                    if result.get('errors'):
+                        msg += f"\n\n⚠️ Warnings: {', '.join(result['errors'])}"
+                    await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=None)
+            except Exception as e:
+                logger.error(f"Error processing cocktail: {e}", exc_info=True)
+                await query.edit_message_text(
+                    f"❌ Failed to process cocktail: {str(e)}",
+                    reply_markup=None
+                )
 
         elif data in ["confirm_yes", "confirm_no"]:
             text = "yes" if data == "confirm_yes" else "no"
@@ -541,6 +824,10 @@ async def main() -> None:
             BotCommand("help", "Get help and see available commands"),
             BotCommand("template", "Get event template (Hebrew format)"),
             BotCommand("browse", "Browse and select a Drive folder for uploads"),
+            BotCommand("select_event", "Select an event to add cocktails to"),
+            BotCommand("cocktails", "List all available cocktails"),
+            BotCommand("search_cocktail", "Search for a cocktail by name"),
+            BotCommand("add_cocktail", "Add a cocktail to current event"),
             BotCommand("cancel", "Reset the current conversation")
         ])
 
@@ -550,6 +837,10 @@ async def main() -> None:
         application.add_handler(CommandHandler("template", template_command))
         application.add_handler(CommandHandler("cancel", cancel))
         application.add_handler(CommandHandler("browse", browse_folders))
+        application.add_handler(CommandHandler("select_event", select_event_command))
+        application.add_handler(CommandHandler("cocktails", list_cocktails_command))
+        application.add_handler(CommandHandler("search_cocktail", search_cocktail_command))
+        application.add_handler(CommandHandler("add_cocktail", add_cocktail_command))
         application.add_handler(CallbackQueryHandler(handle_callback))
         application.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO | filters.Document.ALL, handle_photo))
         application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))

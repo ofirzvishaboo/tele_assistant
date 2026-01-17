@@ -65,6 +65,22 @@ class Settings(BaseSettings):
         description="Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)"
     )
 
+    # Cocktail API
+    COCKTAIL_API_URL: str = Field(
+        default="http://localhost:8000",
+        description="Base URL for Cocktail Recipe Manager API"
+    )
+    COCKTAIL_API_EMAIL: str = Field(
+        description="Email for Cocktail API service account"
+    )
+    COCKTAIL_API_PASSWORD: SecretStr = Field(
+        description="Password for Cocktail API service account"
+    )
+    COCKTAIL_API_LOCATION: str = Field(
+        default="BAR",
+        description="Default location for inventory operations (BAR or WAREHOUSE)"
+    )
+
     @field_validator("GOOGLE_CREDENTIALS_PATH")
     @classmethod
     def validate_credentials_path(cls, v: str) -> str:

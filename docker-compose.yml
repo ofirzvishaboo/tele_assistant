@@ -17,7 +17,7 @@ services:
       timeout: 5s
       retries: 5
     ports:
-      - "5432:5432"  # Expose for debugging (remove in production)
+      - "5433:5432"  # Map host port 5433 to container port 5432 (to avoid conflicts with other projects)
 
   telegram-bot:
     build:
@@ -36,6 +36,8 @@ services:
       - ./token.json:/app/token.json:rw
     environment:
       - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-botuser}:${POSTGRES_PASSWORD:-botpass}@postgres:5432/${POSTGRES_DB:-tele_assistant}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"  # Allows access to host machine from container
     healthcheck:
       test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
       interval: 30s

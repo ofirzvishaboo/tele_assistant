@@ -5,15 +5,17 @@ from langchain_openai import ChatOpenAI
 from langchain_core.tools import tool
 from src.config import settings
 from src.mcp_server import google_service
+from src.cocktail_api import CocktailAPIClient
 import json
 import logging
+import asyncio
 
 logger = logging.getLogger(__name__)
 
 # Define the State
 class AgentState(TypedDict):
     messages: List[BaseMessage]
-    intent: Optional[str] # "schedule_event", "select_folder", "upload_photo", "unknown"
+    intent: Optional[str] # "schedule_event", "list_events", "select_folder", "upload_photo", "add_cocktails", "unknown"
     event_details: Optional[dict]
     conflicts: Optional[List[dict]]
     awaiting_confirmation: bool
@@ -22,6 +24,9 @@ class AgentState(TypedDict):
     error: Optional[str]
     proposed_folder_name: Optional[str]
     awaiting_folder_rename: bool
+    cocktails: Optional[List[dict]]  # List of cocktails to be served
+    awaiting_cocktail_selection: bool  # Waiting for user to specify cocktails
+    cocktail_search_results: Optional[List[dict]]  # Multiple matches when name is ambiguous
 
 # --- Tools Wrappers for LLM ---
 # Although we have MCP, we use direct function calls here for the LLM to 'bind' to.
@@ -48,6 +53,56 @@ def append_row(values: List[str]):
     """Append row to sheet."""
     return google_service.sheets_append_row(values)
 
+# Initialize Cocktail API client
+_cocktail_client: Optional[CocktailAPIClient] = None
+
+def get_cocktail_client() -> CocktailAPIClient:
+    """Get or create Cocktail API client."""
+    global _cocktail_client
+    if _cocktail_client is None:
+        _cocktail_client = CocktailAPIClient()
+    return _cocktail_client
+
+@tool
+async def search_cocktails(query: str) -> List[dict]:
+    """Search cocktails by name. Returns list of matching cocktails."""
+    try:
+        client = get_cocktail_client()
+        matches = await client.search_cocktail_by_name(query)
+        return [{"id": c["id"], "name": c["name"]} for c in matches]
+    except Exception as e:
+        logger.error(f"Error searching cocktails: {e}")
+        return []
+
+@tool
+async def list_cocktails() -> List[dict]:
+    """Get all available cocktails. Returns list with id and name."""
+    try:
+        client = get_cocktail_client()
+        cocktails = await client.get_all_cocktails()
+        return [{"id": c["id"], "name": c["name"]} for c in cocktails]
+    except Exception as e:
+        logger.error(f"Error listing cocktails: {e}")
+        return []
+
+@tool
+async def process_cocktail_order(cocktail_name: str, location: str = "BAR", event_id: Optional[int] = None) -> dict:
+    """Process a cocktail order by name. Reduces inventory stock. Returns summary of movements."""
+    try:
+        client = get_cocktail_client()
+        result = await client.process_cocktail_order(
+            cocktail_name=cocktail_name,
+            location=location,
+            event_id=event_id
+        )
+        return result
+    except ValueError as e:
+        # Handle multiple matches or not found
+        return {"error": str(e)}
+    except Exception as e:
+        logger.error(f"Error processing cocktail order: {e}")
+        return {"error": str(e)}
+
 # --- Nodes ---
 
 llm = ChatOpenAI(model="gpt-4o", api_key=settings.OPENAI_API_KEY.get_secret_value())
@@ -65,7 +120,7 @@ def parse_request(state: AgentState):
     # System prompt to guide extraction
     sys_prompt = """
     You are a scheduling assistant. Extract intent and details from the user's message.
-    Intents: 'schedule_event', 'list_events', 'select_folder', 'upload_photo', 'unknown'.
+    Intents: 'schedule_event', 'list_events', 'select_folder', 'upload_photo', 'add_cocktails', 'unknown'.
     Current time: {current_time}
     Timezone: Asia/Jerusalem (UTC+02:00 or UTC+03:00 depending on DST).
 
@@ -82,10 +137,14 @@ def parse_request(state: AgentState):
     - people_count (if mentioned, else empty string)
     - email (if mentioned, else empty string)
     - equipment (if mentioned, else empty string)
+    - cocktails (list of cocktail names if mentioned, e.g., ["Margarita", "Mojito"])
 
     If intent is 'list_events', extract:
     - start_time (ISO 8601, start of the requested period)
     - end_time (ISO 8601, end of the requested period)
+
+    If intent is 'add_cocktails', extract:
+    - cocktails (list of cocktail names, e.g., ["Margarita", "Old Fashioned"])
 
     Return JSON only.
     """.format(current_time=json.dumps(str(datetime.datetime.now())))
@@ -104,10 +163,16 @@ def parse_request(state: AgentState):
 
         # Normalize: if intent is list_events, put details in event_details too for uniformity or a new key
         # For simplicity reusing event_details but checking intent
-        return {
+        result = {
             "intent": data.get("intent"),
             "event_details": data
         }
+
+        # Extract cocktails if present in event_details
+        if data.get("cocktails"):
+            result["cocktails"] = data.get("cocktails")
+
+        return result
     except Exception as e:
         return {"error": f"Failed to parse: {e}", "intent": "unknown"}
 
@@ -229,6 +294,64 @@ def check_folder_collision(state: AgentState):
         }
     return {"awaiting_folder_rename": False}
 
+def handle_cocktail_selection(state: AgentState):
+    """Handle cocktail selection and process orders."""
+    cocktails = state.get("cocktails", [])
+    if not cocktails:
+        return {"awaiting_cocktail_selection": False}
+
+    # Run async function in sync context
+    client = get_cocktail_client()
+    processed_cocktails = []
+    errors = []
+
+    # Get event ID if available (from folder_selection or event_details)
+    event_id = None
+    if state.get("folder_selection"):
+        # Use folder ID as event identifier
+        event_id = hash(state.get("folder_selection"))
+
+    # Process cocktails synchronously using asyncio
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        for cocktail_name in cocktails:
+            try:
+                result = loop.run_until_complete(
+                    client.process_cocktail_order(
+                        cocktail_name=cocktail_name,
+                        location=settings.COCKTAIL_API_LOCATION,
+                        event_id=event_id
+                    )
+                )
+                if "error" in result:
+                    errors.append(f"{cocktail_name}: {result['error']}")
+                else:
+                    processed_cocktails.append(result)
+            except Exception as e:
+                errors.append(f"{cocktail_name}: {str(e)}")
+    finally:
+        loop.close()
+
+    if processed_cocktails:
+        msg = f"✅ Processed {len(processed_cocktails)} cocktail(s):\n"
+        for result in processed_cocktails:
+            msg += f"• {result['cocktail']} ({len(result['movements'])} ingredients)\n"
+        if errors:
+            msg += f"\n⚠️ Errors: {', '.join(errors)}"
+        return {
+            "messages": [AIMessage(content=msg)],
+            "awaiting_cocktail_selection": False,
+            "cocktails": None  # Clear after processing
+        }
+    elif errors:
+        return {
+            "messages": [AIMessage(content=f"❌ Failed to process cocktails:\n{chr(10).join(errors)}")],
+            "awaiting_cocktail_selection": False
+        }
+
+    return {"awaiting_cocktail_selection": False}
+
 def commit_actions(state: AgentState):
     if state.get("confirmation_response") != "yes":
         return {"messages": [AIMessage(content="Cancelled.")]}
@@ -308,10 +431,44 @@ def commit_actions(state: AgentState):
     ]
     google_service.sheets_append_row(row)
 
+    # Process cocktails if any were specified
+    cocktails = details.get("cocktails", [])
+    cocktail_msg = ""
+    if cocktails:
+        # Process cocktails synchronously using asyncio
+        try:
+            client = get_cocktail_client()
+            processed = []
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                for cocktail_name in cocktails:
+                    try:
+                        result = loop.run_until_complete(
+                            client.process_cocktail_order(
+                                cocktail_name=cocktail_name,
+                                location=settings.COCKTAIL_API_LOCATION,
+                                event_id=hash(folder_id)  # Use folder ID as event identifier
+                            )
+                        )
+                        if "error" not in result:
+                            processed.append(result['cocktail'])
+                    except Exception as e:
+                        logger.warning(f"Failed to process cocktail {cocktail_name}: {e}")
+            finally:
+                loop.close()
+
+            if processed:
+                cocktail_msg = f"\n\n🍹 Processed {len(processed)} cocktail(s): {', '.join(processed)}"
+        except Exception as e:
+            logger.error(f"Error processing cocktails: {e}")
+            cocktail_msg = f"\n\n⚠️ Could not process cocktails: {str(e)}"
+
     return {
-        "messages": [AIMessage(content=f"Done! Event created. Folder: {folder.get('name')}")],
+        "messages": [AIMessage(content=f"Done! Event created. Folder: {folder.get('name')}{cocktail_msg}")],
         "event_details": None, # clear
-        "folder_selection": folder_id  # Save for photo uploads
+        "folder_selection": folder_id,  # Save for photo uploads
+        "cocktails": None  # Clear after processing
     }
 
 # --- Graph Definition ---
@@ -328,6 +485,7 @@ workflow.add_node("process_confirmation", handle_confirmation)
 workflow.add_node("process_folder_rename", process_folder_rename)
 workflow.add_node("check_folder_collision", check_folder_collision)
 workflow.add_node("commit_actions", commit_actions)
+workflow.add_node("handle_cocktail_selection", handle_cocktail_selection)
 
 # Entry logic
 def route_start(state: AgentState):
@@ -353,6 +511,8 @@ def route_after_parse(state):
         return "check_calendar"
     elif intent == "list_events":
         return "list_events"
+    elif intent == "add_cocktails":
+        return "handle_cocktail_selection"
     return END
 
 workflow.add_conditional_edges("parse_request", route_after_parse)
@@ -370,6 +530,7 @@ def route_after_collision_check(state):
 
 workflow.add_conditional_edges("check_folder_collision", route_after_collision_check)
 workflow.add_edge("commit_actions", END)
+workflow.add_edge("handle_cocktail_selection", END)
 
 app = workflow.compile()
 
